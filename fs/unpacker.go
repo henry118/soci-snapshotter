@@ -25,6 +25,8 @@ import (
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/log"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -90,7 +92,14 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		}
 	}
 	defer rc.Close()
-	parents, err := getLayerParents(mounts[0].Options)
+
+	digester := digest.Canonical.Digester()
+	rc = io.NopCloser(io.TeeReader(rc, digester.Hash()))
+
+	var parents []string
+	if len(mounts) > 0 {
+		parents, err = getLayerParents(mounts[0].Options)
+	}
 	if err != nil {
 		return fmt.Errorf("cannot get layer parents: %w", err)
 	}
@@ -103,6 +112,13 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot apply layer: %w", err)
+	}
+
+	digest := digester.Digest()
+	if digest != desc.Digest {
+		return fmt.Errorf("digests did not match")
+	} else {
+		log.G(ctx).Debug("good digest")
 	}
 
 	return nil

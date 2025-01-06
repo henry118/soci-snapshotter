@@ -68,6 +68,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/snapshot"
 	"github.com/awslabs/soci-snapshotter/soci"
 	"github.com/awslabs/soci-snapshotter/soci/store"
+	"github.com/awslabs/soci-snapshotter/util/namedmutex"
 	"github.com/containerd/containerd/mount"
 	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
 	"github.com/containerd/containerd/reference"
@@ -292,6 +293,10 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		mountTimeout:                mountTimeout,
 		fuseMetricsEmitWaitDuration: fuseMetricsEmitWaitDuration,
 		pr:                          pr,
+		//maxPullConcurrency:          fsOpts.maxPullConcurrency,
+		//minConcurrencyLayerSize:     fsOpts.minConcurrencyLayerSize,
+		layerUnpackMap: &sync.Map{},
+		layerUnpackMu:  &namedmutex.NamedMutex{},
 	}, nil
 }
 
@@ -395,6 +400,17 @@ type filesystem struct {
 	mountTimeout                time.Duration
 	fuseMetricsEmitWaitDuration time.Duration
 	pr                          *preresolver
+	//maxPullConcurrency          int64
+	//minConcurrencyLayerSize     int64
+
+	layerUnpackMu  *namedmutex.NamedMutex
+	layerUnpackMap *sync.Map
+}
+
+type unpackStatus struct {
+	unpacked bool
+	location string
+	err      error
 }
 
 func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
@@ -428,6 +444,10 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	unpacker := NewLayerUnpacker(fetcher, archive)
 	desc := s.Target
 
+	if fs.tryRebase(ctx, desc, mountpoint) {
+		return nil
+	}
+
 	// If no descriptor size is given, resolve the layer
 	// to populate it
 	if desc.Size == 0 {
@@ -441,12 +461,72 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 		}
 	}
 
+	for _, l := range s.Manifest.Layers {
+		if l.Digest == desc.Digest {
+			continue
+		}
+
+		go fs.premount(context.TODO(), unpacker, l)
+	}
+
 	err = unpacker.Unpack(ctx, desc, mountpoint, mounts)
 	if err != nil {
 		return fmt.Errorf("cannot unpack the layer: %w", err)
 	}
 
 	return nil
+}
+
+func (fs *filesystem) tryRebase(ctx context.Context, target ocispec.Descriptor, mountpoint string) bool {
+	digest := target.Digest.String()
+	fs.layerUnpackMu.Lock(digest)
+	defer fs.layerUnpackMu.Unlock(digest)
+
+	status, ok := fs.layerUnpackMap.Load(digest)
+	if ok && status.(unpackStatus).unpacked {
+		err := os.Rename(status.(unpackStatus).location, mountpoint)
+		if err == nil {
+			log.G(ctx).WithField("target", target).WithError(err).Error("error rebasing")
+		} else {
+			log.G(ctx).WithField("target", target).WithError(err).Debug("successfully rebased")
+		}
+		return err != nil
+	}
+	return false
+}
+
+func (fs *filesystem) premount(ctx context.Context, unpacker Unpacker, target ocispec.Descriptor) {
+	digest := target.Digest.String()
+	fs.layerUnpackMu.Lock(digest)
+	defer fs.layerUnpackMu.Unlock(digest)
+
+	status, ok := fs.layerUnpackMap.Load(digest)
+	if ok && status.(unpackStatus).unpacked {
+		return
+	}
+
+	log.G(ctx).WithField("target", target).Debug("premounting")
+
+	base := "/var/lib/soci-snapshotter-grpc/premount"
+	mountpoint := filepath.Join(base, target.Digest.String())
+	os.MkdirAll(mountpoint, 0611)
+	if ok && status.(unpackStatus).err != nil {
+		os.RemoveAll(mountpoint)
+	}
+	err := unpacker.Unpack(ctx, target, mountpoint, []mount.Mount{})
+	if err != nil {
+		log.G(ctx).WithField("target", target).WithError(err).Error("error unpacking")
+	} else {
+		log.G(ctx).WithField("target", target).WithError(err).Debug("successfully premounted")
+	}
+	status = unpackStatus{
+		unpacked: err == nil,
+		err:      err,
+		location: mountpoint,
+	}
+
+	fs.layerUnpackMap.Store(digest, status)
+
 }
 
 func (fs *filesystem) getSociContext(ctx context.Context, imageRef, indexDigest, imageManifestDigest string, client *http.Client) (*sociContext, error) {
