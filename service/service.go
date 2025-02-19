@@ -119,6 +119,9 @@ func NewSociSnapshotterService(ctx context.Context, root string, serviceCfg *con
 	if serviceCfg.SnapshotterConfig.AllowInvalidMountsOnRestart {
 		snOpts = append(snOpts, snbase.AllowInvalidMountsOnRestart)
 	}
+	if serviceCfg.SnapshotterConfig.DisableLazyLoading {
+		snOpts = append(snOpts, snbase.WithDisableLazyLoading)
+	}
 
 	snapshotter, err = snbase.NewSnapshotter(ctx, snapshotterRoot(root), fs, snOpts...)
 	if err != nil {

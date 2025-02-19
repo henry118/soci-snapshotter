@@ -69,6 +69,9 @@ type CRIKeychainConfig struct {
 
 // SnapshotterConfig is snapshotter-related config.
 type SnapshotterConfig struct {
+	// DisableLazyLoading disables lazy loading of layers
+	DisableLazyLoading bool `toml:"disable_lazy_loading"`
+
 	// MinLayerSize skips remote mounting of smaller layers
 	MinLayerSize int64 `toml:"min_layer_size"`
 

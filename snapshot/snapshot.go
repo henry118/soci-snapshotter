@@ -117,6 +117,7 @@ type SnapshotterConfig struct {
 	// minLayerSize skips remote mounting of smaller layers
 	minLayerSize                int64
 	allowInvalidMountsOnRestart bool
+	disableLazyLoading          bool
 }
 
 // Opt is an option to configure the remote snapshotter
@@ -139,6 +140,12 @@ func WithMinLayerSize(minLayerSize int64) Opt {
 	}
 }
 
+// WithDisableLazyLoading disables lazy loading of layers
+func WithDisableLazyLoading(config *SnapshotterConfig) error {
+	config.disableLazyLoading = true
+	return nil
+}
+
 func AllowInvalidMountsOnRestart(config *SnapshotterConfig) error {
 	config.allowInvalidMountsOnRestart = true
 	return nil
@@ -154,6 +161,7 @@ type snapshotter struct {
 	userxattr                   bool  // whether to enable "userxattr" mount option
 	minLayerSize                int64 // minimum layer size for remote mounting
 	allowInvalidMountsOnRestart bool
+	disableLazyLoading          bool
 	idmapped                    *sync.Map
 }
 
@@ -207,6 +215,7 @@ func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts 
 		userxattr:                   userxattr,
 		minLayerSize:                config.minLayerSize,
 		allowInvalidMountsOnRestart: config.allowInvalidMountsOnRestart,
+		disableLazyLoading:          config.disableLazyLoading,
 		idmapped:                    idMap,
 	}
 
@@ -439,6 +448,9 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 }
 
 func (o *snapshotter) skipRemoteSnapshotPrepare(ctx context.Context, labels map[string]string) bool {
+	if o.disableLazyLoading {
+		return true
+	}
 	if o.minLayerSize > 0 {
 		if strVal, ok := labels[source.TargetSizeLabel]; ok {
 			if intVal, err := strconv.ParseInt(strVal, 10, 64); err == nil {
