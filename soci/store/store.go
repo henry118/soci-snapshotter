@@ -197,7 +197,7 @@ type ContainerdStore struct {
 var _ Store = (*ContainerdStore)(nil)
 
 func NewContainerdStore(ctx context.Context, storeConfig config.ContentStoreConfig) (context.Context, *ContainerdStore, error) {
-	client, err := containerd.New(storeConfig.ContainerdAddress)
+	client, err := containerd.New(storeConfig.ContainerdAddress, containerd.WithTimeout(time.Hour))
 	if err != nil {
 		return ctx, nil, fmt.Errorf("could not connect to containerd socket for content store access: %w", err)
 	}
@@ -259,36 +259,41 @@ func (s *ContainerdStore) Push(ctx context.Context, expected ocispec.Descriptor,
 	cs := s.client.ContentStore()
 
 	// gRPC message size limit includes some overhead that cannot be calculated from here
-	buf := make([]byte, defaults.DefaultMaxRecvMsgSize/2)
-	totalWritten := 0
+	//buf := make([]byte, defaults.DefaultMaxRecvMsgSize/2)
+	//totalWritten := 0
 	writer, err := cs.Writer(ctx, content.WithRef(expected.Digest.String()))
 	if err != nil {
 		return err
 	}
 	defer writer.Close()
 
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			written, err := writer.Write(buf[:n])
+	/*
+		for {
+			n, err := reader.Read(buf)
+			if n > 0 {
+				written, err := writer.Write(buf[:n])
+				if err != nil {
+					return err
+				}
+				totalWritten += written
+			}
 			if err != nil {
-				return err
+				if err != io.EOF {
+					return err
+				}
+				break
 			}
-			totalWritten += written
-		}
-		if err != nil {
-			if err != io.EOF {
-				return err
+			if n == 0 {
+				break
 			}
-			break
 		}
-		if n == 0 {
-			break
-		}
-	}
 
-	if expected.Size > 0 && expected.Size != int64(totalWritten) {
-		return fmt.Errorf("unexpected copy size %d, expected %d: %w", totalWritten, expected.Size, errdefs.ErrFailedPrecondition)
+		if expected.Size > 0 && expected.Size != int64(totalWritten) {
+			return fmt.Errorf("unexpected copy size %d, expected %d: %w", totalWritten, expected.Size, errdefs.ErrFailedPrecondition)
+		}
+	*/
+	if _, err = io.Copy(writer, reader); err != nil {
+		return err
 	}
 
 	return writer.Commit(ctx, expected.Size, expected.Digest)

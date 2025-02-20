@@ -25,9 +25,9 @@ import (
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/archive/compression"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/log"
-	"github.com/opencontainers/go-digest"
+	"github.com/containerd/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 )
 
 type Unpacker interface {
@@ -81,11 +81,19 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	}
 
 	if !local {
+	again:
 		err := lu.fetcher.Store(ctx, desc, rc)
-		rc.Close()
 		if err != nil {
-			return fmt.Errorf("cannot store layer: %w", err)
+			if errdefs.IsAlreadyExists(err) {
+				rc.Close()
+			} else if errdefs.IsUnavailable(err) {
+				goto again
+			} else {
+				rc.Close()
+				return fmt.Errorf("cannot store layer: %w", err)
+			}
 		}
+		rc.Close()
 		rc, _, err = lu.fetcher.Fetch(ctx, desc)
 		if err != nil {
 			return fmt.Errorf("cannot fetch layer: %w", err)
@@ -93,35 +101,57 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	}
 	defer rc.Close()
 
-	digester := digest.Canonical.Digester()
-	rc = io.NopCloser(io.TeeReader(rc, digester.Hash()))
+	// base := "/var/lib/soci-snapshotter-grpc/unpack"
+	// os.MkdirAll(base, 0611)
+	// tmpfile := filepath.Join(base, desc.Digest.String())
+	// w, err := os.Create(tmpfile)
+	// if err != nil {
+	// 	return fmt.Errorf("cannot create temporary file: %w", err)
+	// }
+	// if _, err = io.Copy(w, rc); err != nil {
+	// 	w.Close()
+	// 	return fmt.Errorf("cannot copy layer to temporary file: %w", err)
+	// }
+	// w.Close()
 
-	var parents []string
-	if len(mounts) > 0 {
-		parents, err = getLayerParents(mounts[0].Options)
-	}
-	if err != nil {
-		return fmt.Errorf("cannot get layer parents: %w", err)
-	}
-	opts := []archive.ApplyOpt{
-		archive.WithConvertWhiteout(archive.OverlayConvertWhiteout),
-	}
-	if len(parents) > 0 {
-		opts = append(opts, archive.WithParents(parents))
-	}
-	_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
-	if err != nil {
-		return fmt.Errorf("cannot apply layer: %w", err)
-	}
+	var eg errgroup.Group
 
-	digest := digester.Digest()
-	if digest != desc.Digest {
-		return fmt.Errorf("digests did not match")
-	} else {
-		log.G(ctx).Debug("good digest")
-	}
+	// eg.Go(func() error {
+	// 	f, err := os.Open(tmpfile)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	defer f.Close()
+	// 	return lu.fetcher.Store(ctx, desc, f)
+	// })
 
-	return nil
+	eg.Go(func() error {
+		// f, err := os.Open(tmpfile)
+		// if err != nil {
+		// 	return err
+		// }
+		// defer f.Close()
+		var parents []string
+		if len(mounts) > 0 {
+			parents, err = getLayerParents(mounts[0].Options)
+		}
+		if err != nil {
+			return fmt.Errorf("cannot get layer parents: %w", err)
+		}
+		opts := []archive.ApplyOpt{
+			archive.WithConvertWhiteout(archive.OverlayConvertWhiteout),
+		}
+		if len(parents) > 0 {
+			opts = append(opts, archive.WithParents(parents))
+		}
+		_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
+		if err != nil {
+			return fmt.Errorf("cannot apply layer: %w", err)
+		}
+		return nil
+	})
+
+	return eg.Wait()
 }
 
 func getLayerParents(options []string) (lower []string, err error) {
