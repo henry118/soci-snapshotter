@@ -71,6 +71,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/soci/store"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
@@ -511,8 +512,10 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	var wg sync.WaitGroup
 	if manifest.Layers[0].Digest.String() == desc.Digest.String() {
 		for _, l := range manifest.Layers {
-			wg.Add(1)
-			go fs.premount(context.TODO(), unpacker, l, &wg)
+			if images.IsLayerType(l.MediaType) {
+				wg.Add(1)
+				go fs.premount(context.TODO(), unpacker, l, &wg)
+			}
 		}
 	}
 

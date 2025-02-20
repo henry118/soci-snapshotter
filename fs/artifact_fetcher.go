@@ -94,10 +94,14 @@ func (f *artifactFetcher) constructRef(desc ocispec.Descriptor) string {
 func (f *artifactFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, bool, error) {
 
 	// Check local store first
-	rc, err := f.localStore.Fetch(ctx, desc)
-	if err == nil {
-		return rc, true, nil
-	}
+	// rc, err := f.localStore.Fetch(ctx, desc)
+	// if err == nil {
+	// 	return rc, true, nil
+	// }
+	var (
+		err error
+		rc  io.ReadCloser
+	)
 
 	log.G(ctx).WithField("digest", desc.Digest.String()).Infof("fetching artifact from remote")
 	if desc.Size == 0 {

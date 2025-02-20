@@ -23,8 +23,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/archive/compression"
@@ -133,7 +136,8 @@ func rapidGzipStream(archive io.Reader) (compression.DecompressReadCloser, error
 func (la *layerArchive) Apply(ctx context.Context, root string, r io.Reader, opts ...archive.ApplyOpt) (int64, error) {
 	// we use containerd implementation here
 	// decompress first and then apply
-	decompressReader, err := rapidGzipStream(r)
+	//decompressReader, err := rapidGzipStream(r)
+	decompressReader, err := compression.DecompressStream(r)
 	if err != nil {
 		return 0, fmt.Errorf("cannot decompress the stream: %w", err)
 	}
@@ -154,75 +158,104 @@ func NewLayerUnpacker(fetcher Fetcher, archive Archive) Unpacker {
 }
 
 func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mountpoint string, mounts []mount.Mount) error {
-	rc, local, err := lu.fetcher.Fetch(ctx, desc)
+	var (
+		offset int64 = 0
+		_100Mb int64 = 100 * 1024 * 1024
+		errg   errgroup.Group
+	)
+
+	base := "/var/lib/soci-snapshotter-grpc/unpack"
+	os.MkdirAll(base, 0611)
+	tmpfile := filepath.Join(base, fmt.Sprintf("%s-%d", desc.Digest.String(), time.Nanosecond))
+
+	w, err := os.OpenFile(tmpfile, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("cannot fetch layer: %w", err)
+		return fmt.Errorf("cannot create temporary file: %w", err)
 	}
+	w.Truncate(desc.Size)
+	w.Close()
 
-	if !local {
-	again:
-		err := lu.fetcher.Store(ctx, desc, rc)
-		if err != nil {
-			if errdefs.IsAlreadyExists(err) || errors.Is(err, errdef.ErrAlreadyExists) {
-				rc.Close()
-			} else if errdefs.IsUnavailable(err) {
-				goto again
-			} else {
-				rc.Close()
-				return fmt.Errorf("cannot store layer: %w", err)
+	for offset = 0; offset < desc.Size; offset += _100Mb {
+		offset := offset
+		errg.Go(func() error {
+			rc, _, ferr := lu.fetcher.Fetch(ctx, desc)
+			if ferr != nil {
+				return fmt.Errorf("cannot fetch layer: %w", ferr)
 			}
-		}
-		rc.Close()
-		rc, _, err = lu.fetcher.Fetch(ctx, desc)
-		if err != nil {
-			return fmt.Errorf("cannot fetch layer: %w", err)
-		}
+			defer rc.Close()
+
+			fw, ferr := os.OpenFile(tmpfile, os.O_RDWR, 0644)
+			if ferr != nil {
+				return fmt.Errorf("cannot create temporary file: %w", ferr)
+			}
+			defer fw.Close()
+
+			rs, ok := rc.(io.ReadSeekCloser)
+			if !ok {
+				io.Copy(fw, rc)
+				return nil
+			}
+			rs.Seek(offset, io.SeekCurrent)
+			fw.Seek(offset, io.SeekCurrent)
+			size := min(_100Mb, desc.Size-offset)
+			if n, _ := io.CopyN(fw, rc, size); int64(n) != size {
+				return fmt.Errorf("failed to read/write n (%d) != expected (%d)", n, size)
+			}
+			return nil
+		})
 	}
-	defer rc.Close()
+	if err := errg.Wait(); err != nil {
+		return err
+	}
 
-	// base := "/var/lib/soci-snapshotter-grpc/unpack"
-	// os.MkdirAll(base, 0611)
-	// tmpfile := filepath.Join(base, fmt.Sprintf("%s-%d", desc.Digest.String(), time.Nanosecond))
-	// w, err := os.Create(tmpfile)
-	// if err != nil {
-	// 	rc.Close()
-	// 	return fmt.Errorf("cannot create temporary file: %w", err)
-	// }
-	// if _, err = io.Copy(w, rc); err != nil {
-	// 	w.Close()
-	// 	rc.Close()
-	// 	return fmt.Errorf("cannot copy layer to temporary file: %w", err)
-	// }
-	// w.Close()
-	// rc.Close()
-
-	var eg errgroup.Group
-
-	// eg.Go(func() error {
-	// 	f, err := os.Open(tmpfile)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	defer f.Close()
+	// if !local {
 	// again:
-	// 	err = lu.fetcher.Store(ctx, desc, f)
+	// 	err := lu.fetcher.Store(ctx, desc, rc)
 	// 	if err != nil {
-	// 		if errdefs.IsAlreadyExists(err) {
+	// 		if errdefs.IsAlreadyExists(err) || errors.Is(err, errdef.ErrAlreadyExists) {
+	// 			rc.Close()
 	// 		} else if errdefs.IsUnavailable(err) {
 	// 			goto again
 	// 		} else {
+	// 			rc.Close()
 	// 			return fmt.Errorf("cannot store layer: %w", err)
 	// 		}
 	// 	}
-	// 	return nil
-	// })
+	// 	rc.Close()
+	// 	rc, _, err = lu.fetcher.Fetch(ctx, desc)
+	// 	if err != nil {
+	// 		return fmt.Errorf("cannot fetch layer: %w", err)
+	// 	}
+	// }
+	// defer rc.Close()
+
+	var eg errgroup.Group
 
 	eg.Go(func() error {
-		// f, err := os.Open(tmpfile)
-		// if err != nil {
-		// 	return err
-		// }
-		// defer f.Close()
+		f, err := os.Open(tmpfile)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+	again:
+		err = lu.fetcher.Store(ctx, desc, f)
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) || errors.Is(err, errdef.ErrAlreadyExists) {
+			} else if errdefs.IsUnavailable(err) {
+				goto again
+			} else {
+				return fmt.Errorf("cannot store layer: %w", err)
+			}
+		}
+		return nil
+	})
+
+	eg.Go(func() error {
+		f, err := os.Open(tmpfile)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
 		var parents []string
 		if len(mounts) > 0 {
 			parents, err = getLayerParents(mounts[0].Options)
@@ -236,7 +269,7 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 		if len(parents) > 0 {
 			opts = append(opts, archive.WithParents(parents))
 		}
-		_, err = lu.archive.Apply(ctx, mountpoint, rc, opts...)
+		_, err = lu.archive.Apply(ctx, mountpoint, f, opts...)
 		if err != nil {
 			return fmt.Errorf("cannot apply layer: %w", err)
 		}
