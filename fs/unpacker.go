@@ -17,9 +17,13 @@
 package fs
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"strings"
 
 	"github.com/containerd/containerd/archive"
@@ -28,6 +32,7 @@ import (
 	"github.com/containerd/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
+	"oras.land/oras-go/v2/errdef"
 )
 
 type Unpacker interface {
@@ -51,10 +56,84 @@ func NewLayerArchive() Archive {
 	return &layerArchive{}
 }
 
+type readCloserWrapper struct {
+	io.Reader
+	compression compression.Compression
+	closer      func() error
+}
+
+func (r *readCloserWrapper) Close() error {
+	if r.closer != nil {
+		return r.closer()
+	}
+	return nil
+}
+
+func (r *readCloserWrapper) GetCompression() compression.Compression {
+	return r.compression
+}
+
+func cmdStream(cmd *exec.Cmd, in io.Reader) (io.ReadCloser, error) {
+	reader, writer := io.Pipe()
+
+	cmd.Stdin = in
+	cmd.Stdout = writer
+
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			writer.CloseWithError(fmt.Errorf("%s: %s", err, errBuf.String()))
+		} else {
+			writer.Close()
+		}
+	}()
+
+	return reader, nil
+}
+
+func rapidgzipDecompress(ctx context.Context, buf io.Reader) (io.ReadCloser, error) {
+	return cmdStream(exec.CommandContext(ctx, "/usr/local/bin/rapidgzip", "-d", "-c"), buf)
+}
+
+func rapidGzipStream(archive io.Reader) (compression.DecompressReadCloser, error) {
+	buf := bufio.NewReader(archive)
+	// _, err := buf.Peek(10)
+	// if err != nil && err != io.EOF {
+	// 	// Note: we'll ignore any io.EOF error because there are some odd
+	// 	// cases where the layer.tar file will be empty (zero bytes) and
+	// 	// that results in an io.EOF from the Peek() call. So, in those
+	// 	// cases we'll just treat it as a non-compressed stream and
+	// 	// that means just create an empty layer.
+	// 	// See Issue docker/docker#18170
+	// 	return nil, err
+	// }
+	ctx, cancel := context.WithCancel(context.Background())
+	gzReader, err := rapidgzipDecompress(ctx, buf)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	return &readCloserWrapper{
+		Reader:      gzReader,
+		compression: compression.Gzip,
+		closer: func() error {
+			cancel()
+			return gzReader.Close()
+		},
+	}, nil
+}
+
 func (la *layerArchive) Apply(ctx context.Context, root string, r io.Reader, opts ...archive.ApplyOpt) (int64, error) {
 	// we use containerd implementation here
 	// decompress first and then apply
-	decompressReader, err := compression.DecompressStream(r)
+	decompressReader, err := rapidGzipStream(r)
 	if err != nil {
 		return 0, fmt.Errorf("cannot decompress the stream: %w", err)
 	}
@@ -84,7 +163,7 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	again:
 		err := lu.fetcher.Store(ctx, desc, rc)
 		if err != nil {
-			if errdefs.IsAlreadyExists(err) {
+			if errdefs.IsAlreadyExists(err) || errors.Is(err, errdef.ErrAlreadyExists) {
 				rc.Close()
 			} else if errdefs.IsUnavailable(err) {
 				goto again
@@ -103,16 +182,19 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 
 	// base := "/var/lib/soci-snapshotter-grpc/unpack"
 	// os.MkdirAll(base, 0611)
-	// tmpfile := filepath.Join(base, desc.Digest.String())
+	// tmpfile := filepath.Join(base, fmt.Sprintf("%s-%d", desc.Digest.String(), time.Nanosecond))
 	// w, err := os.Create(tmpfile)
 	// if err != nil {
+	// 	rc.Close()
 	// 	return fmt.Errorf("cannot create temporary file: %w", err)
 	// }
 	// if _, err = io.Copy(w, rc); err != nil {
 	// 	w.Close()
+	// 	rc.Close()
 	// 	return fmt.Errorf("cannot copy layer to temporary file: %w", err)
 	// }
 	// w.Close()
+	// rc.Close()
 
 	var eg errgroup.Group
 
@@ -122,7 +204,17 @@ func (lu *layerUnpacker) Unpack(ctx context.Context, desc ocispec.Descriptor, mo
 	// 		return err
 	// 	}
 	// 	defer f.Close()
-	// 	return lu.fetcher.Store(ctx, desc, f)
+	// again:
+	// 	err = lu.fetcher.Store(ctx, desc, f)
+	// 	if err != nil {
+	// 		if errdefs.IsAlreadyExists(err) {
+	// 		} else if errdefs.IsUnavailable(err) {
+	// 			goto again
+	// 		} else {
+	// 			return fmt.Errorf("cannot store layer: %w", err)
+	// 		}
+	// 	}
+	// 	return nil
 	// })
 
 	eg.Go(func() error {

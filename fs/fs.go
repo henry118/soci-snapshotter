@@ -69,7 +69,10 @@ import (
 	"github.com/awslabs/soci-snapshotter/snapshot"
 	"github.com/awslabs/soci-snapshotter/soci"
 	"github.com/awslabs/soci-snapshotter/soci/store"
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/namespaces"
 	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
@@ -268,6 +271,11 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		metrics.Register(ns) // Register layer metrics.
 	}
 
+	containerd, err := containerd.New(config.DefaultImageServiceAddress, containerd.WithTimeout(time.Hour))
+	if err != nil {
+		return nil, err
+	}
+
 	go commonmetrics.ListenForFuseFailure(ctx)
 
 	return &filesystem{
@@ -297,6 +305,7 @@ func NewFilesystem(ctx context.Context, root string, cfg config.FSConfig, opts .
 		//minConcurrencyLayerSize:     fsOpts.minConcurrencyLayerSize,
 		//layerUnpackMap: &sync.Map{},
 		//layerUnpackMu:  &namedmutex.NamedMutex{},
+		containerd:  containerd,
 		unpackStore: &unpackStore{unpacks: make(map[string][]*unpackStatus)},
 	}, nil
 }
@@ -406,6 +415,7 @@ type filesystem struct {
 
 	//layerUnpackMu  *namedmutex.NamedMutex
 	//layerUnpackMap *sync.Map
+	containerd  *containerd.Client
 	unpackStore *unpackStore
 }
 
@@ -489,15 +499,12 @@ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels 
 	manifestDesc := ocispec.Descriptor{
 		Digest: manifestDigest,
 	}
-
-	manifestRc, err := fs.contentStore.Fetch(ctx, manifestDesc)
+	buf, err := content.ReadBlob(namespaces.WithNamespace(ctx, "default"), fs.containerd.ContentStore(), manifestDesc)
 	if err != nil {
 		return err
 	}
-
-	p, _ := io.ReadAll(manifestRc)
 	var manifest ocispec.Manifest
-	if err := json.Unmarshal(p, &manifest); err != nil {
+	if err := json.Unmarshal(buf, &manifest); err != nil {
 		return err
 	}
 
