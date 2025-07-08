@@ -559,6 +559,7 @@ func (fs *filesystem) premount(ctx context.Context, desc ocispec.Descriptor, ref
 func (fs *filesystem) rebase(ctx context.Context, dgst digest.Digest, imageDigest, mountpoint string) error {
 	layerJob, err := fs.inProgressImageUnpacks.Claim(imageDigest, dgst.String())
 	if err != nil {
+		fs.inProgressImageUnpacks.RemoveImageWithError(imageDigest, err)
 		return fmt.Errorf("error attempting to claim job to rebase: %w", err)
 	}
 	defer func() {
